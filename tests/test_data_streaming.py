@@ -35,8 +35,10 @@ class DataFileSelectionTests(unittest.TestCase):
                 "seed": 41,
                 "init_yaw": 12.0,
                 "init_pitch": 3.0,
+                "branch_state": {"schema": "bedrock.branch-state.v1"},
                 "tools_kwargs": {"computer": {"create_kwargs": {
                     "seed": 41, "init_yaw": 12.0, "init_pitch": 3.0,
+                    "branch_state": {"schema": "bedrock.branch-state.v1"},
                 }}},
             },
             "images": [{"bytes": b"training-image", "path": None}],
@@ -58,6 +60,10 @@ class DataFileSelectionTests(unittest.TestCase):
         self.assertEqual(
             sentinel["extra_info"]["tools_kwargs"]["computer"]
             ["create_kwargs"]["seed"], -1)
+        self.assertIsNone(sentinel["extra_info"]["branch_state"])
+        self.assertIsNone(
+            sentinel["extra_info"]["tools_kwargs"]["computer"][
+                "create_kwargs"]["branch_state"])
 
 
 class _Features:

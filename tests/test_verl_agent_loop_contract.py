@@ -314,6 +314,21 @@ class VerlAgentLoopContractTests(unittest.TestCase):
         with patch.dict("os.environ", {"BRL_TRAJECTORY_DIR": ""}):
             asyncio.run(exercise())
 
+    def test_training_refuses_experimental_v1_branch_rows_before_open(self):
+        module = _load_agent_loop_module()
+        instance = object.__new__(module.NetheriteAgentLoop)
+        with self.assertRaisesRegex(
+                ValueError, "refuses experimental BSNP v1 branch"):
+            asyncio.run(instance.run(
+                {"temperature": 0.0},
+                raw_prompt=[],
+                tools_kwargs={"computer": {"create_kwargs": {
+                    "task_yaml": "task.yaml",
+                    "branch_state": {
+                        "schema": "bedrock.branch-state.v1",
+                    },
+                }}}))
+
     def test_no_call_floor_survives_an_opt_in_verifier(self):
         module = _load_agent_loop_module()
 

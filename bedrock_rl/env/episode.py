@@ -44,6 +44,8 @@ from uuid import uuid4
 from bedrock_rl.env.engine import (DEFAULT_RASTER, DEFAULT_VIEW_DISTANCE,
                                      EngineError, MagmaEnv)
 from bedrock_rl.env.actions import ProgramError
+from bedrock_rl.env.branch import (canonical_branch_state,
+                                   materialized_branch_snapshot)
 from bedrock_rl.env.observation import render_obs
 from bedrock_rl.env.views import capture_png, open_view
 
@@ -187,44 +189,69 @@ MAX_FORMAT_TAX = 0.9
 MAX_INIT_DRAWS = 32
 
 
-def _open_env(task, seed, **kw):
+def _open_env(task, seed, branch_state=None, **kw):
     """Open the local engine at the task's declared initial state."""
     try:
         kw = dict(kw)
-        kw["snapshot_in"] = task.snapshot_for(
-            int(seed), netherite_home=kw.get("netherite_home"))
-        return MagmaEnv(seed=int(seed), **kw)
+        if branch_state is None:
+            kw["snapshot_in"] = task.snapshot_for(
+                int(seed), netherite_home=kw.get("netherite_home"))
+            return MagmaEnv(seed=int(seed), **kw)
+        with materialized_branch_snapshot(
+                task.path, branch_state,
+                netherite_home=kw.get("netherite_home"),
+                raster=kw.get("raster", "cpu"),
+                view_distance=kw.get("view_distance", DEFAULT_VIEW_DISTANCE),
+                render_set=kw.get("render_set"),
+                random_ticks=kw.get("random_ticks"),
+                ) as (snapshot, state):
+            kw["snapshot_in"] = snapshot
+            # BSNP v1 omits the clock; this aligns the diagnostic replay to
+            # the recorded source setting but cannot restore clock history.
+            kw["world_time"] = state["certification"]["world_time"]
+            # MagmaEnv reads the engine's initial observation in __init__, so
+            # the private verified copy can be removed when this block exits.
+            return MagmaEnv(seed=int(seed), **kw)
     except EngineError as exc:
         raise type(exc)(
             f"{exc}\n  while opening the episode for task {task.name} "
             f"({task.path}) on seed {int(seed)}") from exc
 
 
-def episode_spec(task_yaml, seed, init_yaw, init_pitch):
-    """The four coordinates that name one episode, in ONE shape.
+def episode_spec(task_yaml, seed, init_yaw, init_pitch, branch_state=None):
+    """The coordinates that name one episode, in ONE shape.
 
     Every producer of a dataset row, a rollout spec or a reward
     extra_info builds it here, and Episode.from_spec is the only thing
-    that turns it back into an episode. Five places used to build it by
+    that turns it back into an episode. Four coordinates name a fresh
+    task start. The optional fifth, ``branch_state``, names a validated
+    experimental diagnostic snapshot; omitting it preserves the legacy shape and
+    fresh-start behavior exactly. Five places used to build the spec by
     hand and two of them disagreed about whether the pose was the one
     asked for or the one the engine settled at.
     """
-    return {"task_yaml": str(task_yaml), "seed": int(seed),
+    spec = {"task_yaml": str(task_yaml), "seed": int(seed),
             "init_yaw": float(init_yaw), "init_pitch": float(init_pitch)}
+    branch_state = canonical_branch_state(branch_state)
+    if branch_state is not None:
+        spec["branch_state"] = branch_state
+    return spec
 
 
 def spec_values(spec):
     """A recorded spec read back, as (task_yaml, seed, yaw, pitch).
 
-    The reading half of the pair above, and the only one. `from_spec`
-    turns a spec into an episode and is the reason the shape is fixed,
-    but it is not the only thing that ever has to know what a spec SAYS:
-    anything that identifies an episode across a process boundary has to
-    read the same four fields the same way, and a second reader that
-    coerces them differently is a second opinion about which episode is
-    which. Coercion matters here rather than being decoration -- a
-    parquet row hands back numpy scalars, a live caller hands back
-    Python floats, and str() of those two is not the same string.
+    The backward-compatible reading half for the four scalar coordinates.
+    The optional mapping-valued fifth coordinate is validated separately by
+    ``canonical_branch_state`` rather than changing this established return
+    shape. `from_spec` turns the complete spec into an episode and is the
+    reason the shape is fixed, but it is not the only thing that ever has to
+    know what its scalar coordinates SAY: anything that identifies an episode
+    across a process boundary has to read the same four fields the same way,
+    and a second reader that coerces them differently is a second opinion
+    about which episode is which. Coercion matters here rather than being
+    decoration -- a parquet row hands back numpy scalars, a live caller hands
+    back Python floats, and str() of those two is not the same string.
     """
     return (str(spec["task_yaml"]), int(spec["seed"]),
             float(spec["init_yaw"]), float(spec["init_pitch"]))
@@ -236,8 +263,12 @@ class Episode:
     def __init__(self, task, seed, init_yaw, init_pitch, parser,
                  netherite_home=None, frames_root=None,
                  raster=None, view_distance=None, capture_every=None,
-                 capture_frames=True, tick_observer=None):
+                 capture_frames=True, tick_observer=None,
+                 branch_state=None, render_set=None, random_ticks=None):
         self.task = task
+        branch_state = canonical_branch_state(branch_state)
+        if branch_state is not None and random_ticks is None:
+            random_ticks = False
         self.frame_width, self.frame_height = FRAME_W, FRAME_H
         self.capture_frames = bool(capture_frames)
         # Runtime-only sampling hook used by replay media. It observes a
@@ -246,6 +277,7 @@ class Episode:
         self._tick_observer = tick_observer
         self.model_view, selected_home, self.view_provenance = open_view(
             task.view, netherite_home)
+        self.netherite_home = os.fspath(selected_home)
         # NETHERITE_FRAME_SCALE changes the actual policy pixels (including
         # semantic-view GUI fallback). Record the effective value and size so
         # replay/evaluation provenance cannot certify mixed resolutions as the
@@ -257,17 +289,23 @@ class Episode:
         # rasterizer for the per-turn frame: explicit arg, else the task
         # YAML's `raster:` key, else NETHERITE_RASTER, else cpu.
         raster = raster or task.raw.get("raster") or DEFAULT_RASTER
+        self.raster = str(raster).lower()
         # renderer chunk radius: explicit arg, else the task YAML, else
         # NETHERITE_VIEW_DISTANCE, else the engine default. Must be the
         # same at data generation and at rollout, see engine.py.
         vd = (view_distance or task.raw.get("view_distance")
               or DEFAULT_VIEW_DISTANCE)
+        self.view_distance = int(vd)
+        self.render_set = (None if render_set is None else dict(render_set))
+        self.random_ticks = random_ticks
         self._frames_dir = (_owned_frames_dir(frames_root)
                             if frames_root else None)
         kw = dict(netherite_home=str(selected_home),
                   frames_dir=self._frames_dir, frame_w=FRAME_W,
-                  frame_h=FRAME_H, raster=raster,
-                  view_distance=vd, capture_every=capture_every,
+                  frame_h=FRAME_H, raster=self.raster,
+                  view_distance=self.view_distance,
+                  capture_every=capture_every, render_set=self.render_set,
+                  random_ticks=self.random_ticks,
                   # the event journal, which the journal-backed checks
                   # read off env.journal; `journal: false` in a task
                   # turns it off, and Task refuses that combination when
@@ -277,9 +315,10 @@ class Episode:
                   world_time=task.initial_state.world.get("time"))
         self.env = None
         try:
-            self.env = _open_env(task, int(seed), **kw)
+            self.env = _open_env(
+                task, int(seed), branch_state=branch_state, **kw)
             self._initialize_state(
-                task, seed, init_yaw, init_pitch, parser)
+                task, seed, init_yaw, init_pitch, parser, branch_state)
         except BaseException:
             try:
                 self.close()
@@ -290,15 +329,24 @@ class Episode:
                 pass
             raise
 
-    def _initialize_state(self, task, seed, init_yaw, init_pitch, parser):
+    def _initialize_state(self, task, seed, init_yaw, init_pitch, parser,
+                          branch_state=None):
         """Finish initialization while the constructor owns cleanup."""
         self.env.reset_pose(float(init_yaw), float(init_pitch))
         o = self.env.obs
         # Record the requested pose as the canonical episode coordinate. The
         # engine may represent an equivalent settled yaw outside the task's
         # declared range because it accumulates rotations without wrapping.
-        self.spec = episode_spec(task.path, seed, init_yaw, init_pitch)
+        self.spec = episode_spec(
+            task.path, seed, init_yaw, init_pitch, branch_state)
         self.spec["view"] = dict(self.view_provenance)
+        if branch_state is not None:
+            self.spec["runtime"] = {
+                "raster": self.raster,
+                "view_distance": self.view_distance,
+                "render_set": dict(self.render_set or {}),
+                "random_ticks": self.random_ticks,
+            }
         # How many poses were drawn to arrive at this one, which is 1 for
         # every episode built from a pose somebody already has: a replay,
         # a hand-written pose, a recorded spec. Only `draw` below can move
@@ -359,6 +407,53 @@ class Episode:
         self.t0_png = (capture_png(self.model_view, self)
                        if self.capture_frames else self._frameless_tick())
         self._sync_screen()
+        if branch_state is not None:
+            # This diagnostic point is required to be motionless.  Any position or inventory
+            # change during reset/t0 means setup altered reward-relevant state
+            # and this row is not a safe branch start.
+            after = self.env.obs
+            stable = (
+                (o["x"], o["y"], o["z"]) ==
+                (after["x"], after["y"], after["z"])
+                and tuple(o["hotbar_ids"]) == tuple(after["hotbar_ids"])
+                and tuple(o["hotbar_counts"]) == tuple(after["hotbar_counts"])
+                and tuple(o.get("hotbar_meta", (0,) * 9)) ==
+                tuple(after.get("hotbar_meta", (0,) * 9))
+                and dict(o["inv_counts"]) == dict(after["inv_counts"])
+                and not self.gui_open
+                and int(after.get("container", 0)) == 0
+            )
+            if not stable:
+                raise RuntimeError(
+                    "experimental branch setup changed position, inventory, or "
+                    "screen state before t0")
+            # Delta checks and convergence start at the image shown to the
+            # model, never at a pre-capture pose that setup could move away
+            # from.  This prevents the first model action receiving setup
+            # movement or pickup credit.
+            self.start_obs = {
+                "x": after["x"], "y": after["y"], "z": after["z"],
+                "inv_counts": dict(after["inv_counts"]),
+                "hotbar_ids": tuple(after["hotbar_ids"]),
+                "hotbar_counts": tuple(after["hotbar_counts"]),
+                "hotbar_meta": tuple(
+                    after.get("hotbar_meta", (0,) * 9)),
+            }
+            self.converge_cell = (
+                task.converge.locate(self.env) if task.converge else None)
+            self.phi = (
+                task.converge.phi(self.env, self.converge_cell)
+                if task.converge else 0.0)
+            success = getattr(task, "success", None)
+            failed = getattr(task, "fail", None)
+            if ((success is not None
+                 and success.initially_solved(self.env, self.start_obs))
+                    or (failed is not None
+                        and failed.initially_solved(
+                            self.env, self.start_obs))):
+                raise RuntimeError(
+                    "experimental branch is already terminal at its model-visible "
+                    "t0 baseline")
         # reset_pose and the t0 capture tick the live engine. Their events
         # describe episode setup, not model behavior, so journal-backed task
         # checks begin immediately after the first observation is complete.
@@ -417,7 +512,8 @@ class Episode:
     def from_spec(cls, spec, parser, task=None, **kw):
         """The episode a recorded spec names.
 
-        The ONE thing that turns the four coordinates back into a world,
+        The ONE thing that turns the four fresh-start coordinates and
+        optional branch coordinate back into a world,
         reading them through `spec_values` so that a producer and a
         consumer cannot hold different opinions about what they mean.
         `parser` is the bound parse function, exactly as the constructor
@@ -425,11 +521,34 @@ class Episode:
         spec's own task_yaml is what identifies the task, and it resolves
         on this box through bedrock_rl/env/task.py.
         """
-        from bedrock_rl.env.task import Task
+        from bedrock_rl.env.task import Task, resolve_path
         task_yaml, seed, init_yaw, init_pitch = spec_values(spec)
+        branch_state = canonical_branch_state(spec.get("branch_state"))
+        recorded_runtime = spec.get("runtime")
+        if branch_state is not None:
+            expected_runtime = branch_state["runtime"]
+            if recorded_runtime is not None and \
+                    dict(recorded_runtime) != expected_runtime:
+                raise RuntimeError(
+                    "recorded branch runtime does not match branch_state")
+            for key, value in expected_runtime.items():
+                if key in kw and kw[key] is not None and kw[key] != value:
+                    raise RuntimeError(
+                        f"branch runtime {key}={value!r} conflicts with "
+                        f"requested {kw[key]!r}")
+                kw[key] = value
         if task is None:
             task = Task.load(task_yaml)
-        episode = cls(task, seed, init_yaw, init_pitch, parser=parser, **kw)
+        elif branch_state is not None:
+            named = Path(resolve_path(task_yaml)).resolve()
+            supplied = Path(task.path).expanduser().resolve()
+            if named != supplied:
+                raise ValueError(
+                    "supplied task does not match branch spec task_yaml: "
+                    f"{supplied} != {named}")
+        episode = cls(
+            task, seed, init_yaw, init_pitch, parser=parser,
+            branch_state=branch_state, **kw)
         recorded_view = spec.get("view")
         if recorded_view is not None and recorded_view != episode.spec["view"]:
             episode.close()

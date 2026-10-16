@@ -386,6 +386,16 @@ class NetheriteAgentLoop(AgentLoopBase):
         return str(path)
 
     async def run(self, sampling_params: dict, **kwargs) -> AgentLoopOutput:
+        tools_kwargs = kwargs.get("tools_kwargs") or {}
+        create = ((tools_kwargs.get("computer") or {})
+                  .get("create_kwargs") or {})
+        branch_state = create.get("branch_state")
+        if (isinstance(branch_state, dict)
+                and branch_state.get("schema") == "bedrock.branch-state.v1"):
+            raise ValueError(
+                "NetheriteAgentLoop refuses experimental BSNP v1 branch "
+                "rows: only exact diagnostic traces were measured and the "
+                "guaranteed continuation window is zero")
         raw_messages = copy_messages(kwargs["raw_prompt"])
         multi_modal = await self.process_multi_modal_info(raw_messages)
         images = list(multi_modal.get("images") or ())
@@ -395,9 +405,6 @@ class NetheriteAgentLoop(AgentLoopBase):
                 f"the rollout prompt supplied {len(images)}")
         canonical, image_ids = _canonicalize(raw_messages, images)
 
-        tools_kwargs = kwargs.get("tools_kwargs") or {}
-        create = ((tools_kwargs.get("computer") or {})
-                  .get("create_kwargs") or {})
         if "task_yaml" not in create:
             raise ValueError("NetheriteAgentLoop needs tools_kwargs.computer."
                              "create_kwargs.task_yaml in every dataset row")

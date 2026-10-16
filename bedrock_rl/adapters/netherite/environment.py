@@ -60,8 +60,9 @@ class NetheriteSession:
 class NetheriteEnvironment:
     """Open a Netherite task behind the generic session contract.
 
-    ``episode`` may carry the four deterministic coordinates of an existing
-    trial. Without it, the adapter draws a legal pose from the configured
+    ``episode`` may carry the four deterministic fresh-start coordinates of
+    an existing trial plus the optional experimental diagnostic ``branch_state``
+    coordinate. Without it, the adapter draws a legal pose from the configured
     seed exactly as the existing data builders do.
     """
 

@@ -143,6 +143,7 @@ your work needs.
 | Understand package boundaries and extension points | [Architecture](docs/architecture.md) |
 | Make a Minecraft task and reward | [Tasks](docs/tasks.md) |
 | Generate prompts or demonstrations and write a policy | [Synthetic data](docs/synthetic-data.md) |
+| Review experimental BSNP v1 branch-coordinate evidence and limits | [BSNP v1 branch coordinate](docs/branch-state-v1.md) |
 | Launch locally, multi-node, or on Modal | [Training](docs/training.md) |
 | Use or add a VLM family | [Models](docs/models.md) |
 | Add tools, context management, guidance, or a harness | [Custom agents](docs/custom-agents.md) |

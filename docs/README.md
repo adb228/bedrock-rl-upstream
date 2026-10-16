@@ -23,6 +23,7 @@ Start with the page for the thing you are changing:
 | Understand package boundaries and extension points | [Architecture](architecture.md) |
 | Create a Minecraft environment and reward | [Make a task](tasks.md) |
 | Generate prompts or successful demonstrations | [Synthetic data](synthetic-data.md) |
+| Understand experimental BSNP v1 diagnostics and limits | [BSNP v1 branch coordinate](branch-state-v1.md) |
 | Train locally, on several nodes, or on Modal | [Launch training](training.md) |
 | Use or register another VLM family | [Models](models.md) |
 | Add tools, context management, hints, probes, or a harness | [Customize the agent](custom-agents.md) |

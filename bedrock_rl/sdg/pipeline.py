@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import math
 import os
 import random
+import tempfile
 import time
 from pathlib import Path
 from typing import Mapping
+from uuid import uuid4
 
 import yaml
 
@@ -29,7 +32,14 @@ from bedrock_rl.core.tools import ToolCall, ToolResult
 from bedrock_rl.core.trajectory import TrajectoryRecorder, TrajectoryView
 from bedrock_rl.data import png_bytes
 from bedrock_rl.sdg.policy.oracle import expert_cu
-from bedrock_rl.env.engine import EngineTimeout
+from bedrock_rl.env.engine import DEFAULT_VIEW_DISTANCE, EngineTimeout
+from bedrock_rl.env.branch import (
+    MAX_PROBE_TICKS,
+    branch_output_dir,
+    inspect_quiescent_snapshot,
+    make_branch_state,
+    snapshot_sha256,
+)
 from bedrock_rl.env.episode import (Episode, episode_spec, retain_frames_dir,
                                       tool_response_text)
 from bedrock_rl.env.snapshots import SnapshotRejected
@@ -101,7 +111,8 @@ def load_episode_specs(path):
 
     frame = pd.read_parquet(path, columns=["extra_info"])
     return [episode_spec(info["task_yaml"], info["seed"],
-                         info["init_yaw"], info["init_pitch"])
+                         info["init_yaw"], info["init_pitch"],
+                         info.get("branch_state"))
             for info in frame["extra_info"]]
 
 
@@ -174,6 +185,381 @@ class EpisodeDatasetGenerator:
                 "question": prompt, "answer": cu_tool_call(actions),
                 "reward": float(episode.final_reward()),
                 "seed": int(case.seed),
+                "images": [{"bytes": episode.t0_png, "path": None}],
+            }
+        finally:
+            episode.close()
+
+
+class BranchPointDatasetGenerator:
+    """Write one RL row from an empirically probed BSNP v1 branch point.
+
+    This component accepts only movement/look/wait controls, settles to a
+    motionless on-ground state, and checks the state BSNP v1 represents.
+    ``continuation`` is mandatory: source and restore execute those exact
+    public turns and must produce identical complete observations, CPU frames,
+    and final BSNP v1 bytes within a bounded diagnostic run. BSNP v1 omits
+    hidden live state, so only that listed trace passed and the guaranteed
+    continuation window is zero.
+    """
+
+    thread_safe = False
+    _ACTION_KEYS = {
+        "mouse_move": frozenset(("action", "coordinate")),
+        "wait": frozenset(("action", "ticks")),
+        "key": frozenset(("action", "k", "key", "ticks")),
+    }
+    _MOVEMENT_KEYS = frozenset((
+        "w", "a", "s", "d", "space", "sneak", "sprint",
+    ))
+
+    def __init__(self, task, prefix, continuation, settle_ticks=10,
+                 netherite_home=None, frames_root=None, *, base_dir=".",
+                 metadata=None, data_source=DATA_SOURCE):
+        self.task_path = _path(task, base_dir).resolve()
+        self.task = Task.load(str(self.task_path))
+        world = self.task.initial_state.world
+        if world.get("mobs") is not False:
+            raise ValueError(
+                "BSNP v1 branch tasks must explicitly declare "
+                "initial_state.world.mobs: false")
+        if "time" not in world:
+            raise ValueError(
+                "BSNP v1 branch tasks require an explicit "
+                "initial_state.world.time")
+        if self.task.raw.get("raster", "cpu") != "cpu":
+            raise ValueError("BSNP v1 branch tasks require raster 'cpu'")
+        view_distance = self.task.raw.get("view_distance")
+        if view_distance is None:
+            view_distance = DEFAULT_VIEW_DISTANCE
+        if isinstance(view_distance, bool) or not isinstance(
+                view_distance, int):
+            raise TypeError(
+                "BSNP v1 branch task view_distance must be an integer")
+        if not 1 <= view_distance <= 8:
+            raise ValueError(
+                "BSNP v1 branch task view_distance must be in 1..8")
+        self.prefix = self._controls(prefix, "prefix")
+        self.continuation = self._controls(continuation, "continuation")
+        if isinstance(settle_ticks, bool) or not isinstance(settle_ticks, int):
+            raise TypeError("branch settle_ticks must be an integer")
+        if not 2 <= settle_ticks <= 200:
+            raise ValueError("branch settle_ticks must be in 2..200")
+        self.settle_ticks = int(settle_ticks)
+        if len(self.prefix) > self.task.max_turns:
+            raise ValueError(
+                f"branch prefix has {len(self.prefix)} turns but task "
+                f"max_turns is {self.task.max_turns}")
+        self.branches_dir = branch_output_dir(self.task.path)
+        self.netherite_home = netherite_home
+        self.frames_root = (frames_root or os.path.join(
+            "/tmp", f"bedrock-branch-sdg-{self.task.name}"))
+        self.metadata = dict(metadata or {})
+        self.data_source = str(data_source)
+        if not self.data_source:
+            raise ValueError("data_source cannot be empty")
+
+    @classmethod
+    def _controls(cls, value, what):
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValueError(
+                f"BranchPointDatasetGenerator {what} must be a non-empty "
+                "list of turns")
+        normalized = []
+        for turn_index, turn in enumerate(value):
+            if not isinstance(turn, (list, tuple)) or not turn:
+                raise TypeError(
+                    f"branch {what} turn {turn_index} must be a non-empty "
+                    "list of action mappings")
+            if any(not isinstance(action, Mapping) for action in turn):
+                raise TypeError(
+                    f"branch {what} turn {turn_index} contains a non-mapping "
+                    "action")
+            copied = []
+            for action in turn:
+                action = copy.deepcopy(dict(action))
+                name = action.get("action")
+                if name not in cls._ACTION_KEYS:
+                    raise ValueError(
+                        f"branch {what} permits only movement/look/wait "
+                        f"actions, not {name!r}")
+                unknown = sorted(set(action) - cls._ACTION_KEYS[name])
+                if unknown:
+                    raise ValueError(
+                        f"branch {what} {name} action has unknown keys: "
+                        + ", ".join(unknown))
+                if name == "key":
+                    if "k" in action and "key" in action:
+                        raise ValueError(
+                            f"branch {what} key action cannot supply both "
+                            "'k' and 'key'")
+                    keys = action.get("k", action.get("key"))
+                    keys = keys if isinstance(keys, list) else [keys]
+                    lowered = [str(key).lower() for key in keys]
+                    if not lowered or any(
+                            key not in cls._MOVEMENT_KEYS for key in lowered):
+                        raise ValueError(
+                            f"branch {what} key actions permit only "
+                            "w/a/s/d/space/sneak/sprint")
+                copied.append(action)
+            normalized.append(copied)
+        json.dumps(normalized, allow_nan=False, sort_keys=True)
+        return normalized
+
+    @staticmethod
+    def _portable_observation(episode):
+        def portable(value):
+            if isinstance(value, memoryview):
+                return {"__bytes__": bytes(value).hex()}
+            if isinstance(value, Mapping):
+                return {str(key): portable(item)
+                        for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [portable(item) for item in value]
+            return value
+        return portable(episode.env.obs)
+
+    @classmethod
+    def _environment_observation_hash(cls, env):
+        body = json.dumps(
+            cls._portable_observation(
+                type("_EpisodeView", (), {"env": env})()),
+            sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(body.encode()).hexdigest()
+
+    @classmethod
+    def _observation_hash(cls, episode):
+        body = json.dumps(
+            cls._portable_observation(episode), sort_keys=True,
+            separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(body.encode()).hexdigest()
+
+    @staticmethod
+    def _checked_step(episode, actions, label):
+        penalty = episode.penalty
+        result = episode.step(
+            json.dumps(actions, separators=(",", ":")), count_turn=False)
+        if episode.penalty != penalty:
+            raise CaseRejected(
+                f"{label} was malformed or penalized instead of executing",
+                code="branch_malformed_control")
+        return result
+
+    def _write_snapshot(self, episode, case):
+        self.branches_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.branches_dir / (
+            f".branch.{os.getpid()}.{int(case.index)}.{uuid4().hex}.bsnp")
+        try:
+            episode.env.snapshot(
+                temporary, radius=self.task.snapshot_radius)
+            digest = snapshot_sha256(temporary)
+            destination = self.branches_dir / f"{digest}.bsnp"
+            if destination.exists():
+                if snapshot_sha256(destination) != digest:
+                    raise RuntimeError(
+                        f"content-addressed branch snapshot {destination} "
+                        "does not match its filename")
+                temporary.unlink()
+            else:
+                os.replace(temporary, destination)
+            inspect_quiescent_snapshot(destination)
+            return destination
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def __call__(self, case):
+        rng = random.Random(case.decision_seed)
+        parser = cu_parser(self.task)
+        source_tick_hashes = []
+        probe_tick_hashes = []
+        source = Episode.draw(
+            self.task, case.seed, rng, parser=parser,
+            netherite_home=self.netherite_home,
+            frames_root=self.frames_root, raster="cpu",
+            capture_frames=True,
+            render_set={"anim_textures": 0, "no_hand": 1},
+            random_ticks=False,
+            tick_observer=lambda env: source_tick_hashes.append(
+                self._environment_observation_hash(env)))
+        branch_spec = None
+        probe = None
+        branch_home = None
+        probe_evidence = None
+        try:
+            for turn, actions in enumerate(self.prefix):
+                self._checked_step(
+                    source, actions, f"branch prefix turn {turn + 1}")
+                if source.done:
+                    raise CaseRejected(
+                        f"branch prefix reached a terminal state at turn "
+                        f"{turn + 1}; a branch point must remain mid-episode",
+                        code="branch_prefix_terminal")
+            self._checked_step(
+                source,
+                [{"action": "wait", "ticks": self.settle_ticks}],
+                "branch settling turn")
+            if source.done:
+                raise CaseRejected(
+                    "branch settling reached a terminal task state",
+                    code="branch_settle_terminal")
+
+            # BSNP v1 omits both world-clock counters.  The exact original
+            # engine identity makes elapsed header ticks a stable clock
+            # alignment rule: --set establishes the task time at process
+            # boot, then every observation tick advances world_time once.
+            world_time = (
+                int(self.task.initial_state.world["time"])
+                + int(source.env.obs["tick"])
+                - int(source.env.engine_tick_origin)
+            )
+            snapshot = self._write_snapshot(source, case)
+            state = make_branch_state(
+                snapshot, self.task.path,
+                netherite_home=source.netherite_home,
+                raster=source.raster,
+                view_distance=source.view_distance,
+                world_time=world_time,
+                settle_ticks=self.settle_ticks)
+            branch_home = source.netherite_home
+            branch_spec = episode_spec(
+                self.task.path, case.seed,
+                source.env.obs["yaw"], source.env.obs["pitch"], state)
+            # snapshot() advances the source one idle tick.  Its next frame
+            # tick is therefore aligned with branch reset_pose + t0.
+            source_t0 = png_bytes(source.frame())
+            probe = Episode.from_spec(
+                branch_spec, parser, task=self.task,
+                netherite_home=source.netherite_home,
+                frames_root=self.frames_root, raster="cpu",
+                view_distance=source.view_distance,
+                tick_observer=lambda env: probe_tick_hashes.append(
+                    self._environment_observation_hash(env)))
+            source_hash = self._observation_hash(source)
+            probe_hash = self._observation_hash(probe)
+            if source_hash != probe_hash or source_t0 != probe.t0_png:
+                source_obs = self._portable_observation(source)
+                probe_obs = self._portable_observation(probe)
+                differing = sorted(
+                    key for key in set(source_obs) | set(probe_obs)
+                    if source_obs.get(key) != probe_obs.get(key))
+                pixel_detail = ""
+                if source_t0 and probe.t0_png:
+                    from PIL import Image, ImageChops
+                    source_image = Image.open(io.BytesIO(source_t0)).convert(
+                        "RGB")
+                    probe_image = Image.open(
+                        io.BytesIO(probe.t0_png)).convert("RGB")
+                    difference = ImageChops.difference(
+                        source_image, probe_image)
+                    pixel_detail = (
+                        f", pixel_bbox={difference.getbbox()}")
+                raise CaseRejected(
+                    "source continuation and reopened branch disagree at t0 "
+                    f"(obs {source_hash[:12]} != {probe_hash[:12]}, frames "
+                    f"{hashlib.sha256(source_t0 or b'').hexdigest()[:12]} != "
+                    f"{hashlib.sha256(probe.t0_png or b'').hexdigest()[:12]}, "
+                    f"fields {differing}{pixel_detail})",
+                    code="branch_source_mismatch")
+            probe_start_tick = int(source.env.obs["tick"])
+            source_tick_hashes.clear()
+            probe_tick_hashes.clear()
+            for turn, actions in enumerate(self.continuation):
+                source_at = len(source_tick_hashes)
+                probe_at = len(probe_tick_hashes)
+                source_result = self._checked_step(
+                    source, actions,
+                    f"source continuation turn {turn + 1}")
+                probe_result = self._checked_step(
+                    probe, actions,
+                    f"reopened continuation turn {turn + 1}")
+                if (source_tick_hashes[source_at:] !=
+                        probe_tick_hashes[probe_at:]
+                        or self._observation_hash(source)
+                        != self._observation_hash(probe)
+                        or png_bytes(source_result[1])
+                        != png_bytes(probe_result[1])):
+                    raise CaseRejected(
+                        "source continuation and reopened branch diverged "
+                        f"after probe turn {turn + 1}",
+                        code="branch_source_mismatch")
+            probe_end_tick = int(source.env.obs["tick"])
+            continuation_ticks = probe_end_tick - probe_start_tick
+            if continuation_ticks > MAX_PROBE_TICKS:
+                raise CaseRejected(
+                    "BSNP v1 continuation probe exceeded the diagnostic "
+                    f"{MAX_PROBE_TICKS}-tick measurement budget "
+                    f"({continuation_ticks} ticks)",
+                    code="branch_probe_too_long")
+            # Compare every byte BSNP v1 can represent.  This deliberately
+            # does not claim to compare omitted plant RNG/growth, scheduled
+            # updates, live counters, or clocks.
+            with tempfile.TemporaryDirectory(
+                    prefix="bedrock-branch-v1-gate-") as directory:
+                source_end = Path(directory) / "source.bsnp"
+                probe_end = Path(directory) / "reopened.bsnp"
+                source.env.snapshot(
+                    source_end, radius=self.task.snapshot_radius)
+                probe.env.snapshot(
+                    probe_end, radius=self.task.snapshot_radius)
+                source_digest = snapshot_sha256(source_end)
+                probe_digest = snapshot_sha256(probe_end)
+                if source_end.read_bytes() != probe_end.read_bytes():
+                    raise CaseRejected(
+                        "source continuation and reopened branch BSNP v1 "
+                        "represented state diverged after the probe",
+                        code="branch_source_mismatch")
+                probe_evidence = {
+                    "continuation_turns": len(self.continuation),
+                    "continuation_sha256": hashlib.sha256(json.dumps(
+                        self.continuation, sort_keys=True, allow_nan=False,
+                        separators=(",", ":")).encode()).hexdigest(),
+                    "source_tick_start": probe_start_tick,
+                    "source_tick_end": probe_end_tick,
+                    "continuation_ticks": continuation_ticks,
+                    "per_tick_observations": len(source_tick_hashes),
+                    "max_probe_ticks": MAX_PROBE_TICKS,
+                    "snapshot_format": "BSNP/1",
+                    "represented_state_sha256": source_digest,
+                    "restored_state_sha256": probe_digest,
+                    "scope": (
+                        "exact diagnostic trace only; zero guaranteed "
+                        "continuation ticks"),
+                }
+        finally:
+            if probe is not None:
+                probe.close()
+            source.close()
+
+        episode = Episode.from_spec(
+            branch_spec, parser, task=self.task,
+            netherite_home=branch_home,
+            frames_root=self.frames_root, raster="cpu",
+            view_distance=state["runtime"]["view_distance"])
+        try:
+            prompt = cu_user_prompt(self.task, episode.env)
+            spec = dict(
+                episode.spec,
+                task_yaml=relative_path(episode.spec["task_yaml"]),
+                interface=INTERFACE,
+            )
+            spec["need_tools_kwargs"] = True
+            spec["branch_probe"] = probe_evidence
+            spec["branch_contract"] = {
+                "status": "experimental",
+                "training_eligible": False,
+                "guaranteed_continuation_ticks": 0,
+            }
+            spec["tools_kwargs"] = {TOOL_NAME: {"create_kwargs": dict(
+                episode.spec, task_yaml=spec["task_yaml"],
+                interface=INTERFACE)}}
+            return {
+                "data_source": self.data_source,
+                "prompt": [{"role": "user", "content": prompt}],
+                "ability": "game",
+                "reward_model": {"style": "rule", "ground_truth": ""},
+                "extra_info": spec,
+                "agent_name": "bedrock",
                 "images": [{"bytes": episode.t0_png, "path": None}],
             }
         finally:

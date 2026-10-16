@@ -115,6 +115,149 @@ world or policy vetoes and is summarized by reason. Any other generator
 exception stops the batch immediately instead of being mistaken for a bad
 seed.
 
+## Branch-point RL rows
+
+`BranchPointDatasetGenerator` makes an ordinary RL prompt whose episode begins
+at an **empirically probed BSNP v1** point. It uses exactly the original
+Netherite patch stack, `0001` through `0012`; there is no `0013`, LIV2, or
+v2-profile dependency.
+
+BSNP v1 is sufficient for initial-state caching: it records seed and tick,
+player pose/collision/motion, selected player-controller fields, all 37
+inventory slots, live ordinary item entities, the captured block region, and
+a derived coal index. That is the existing deterministic fresh-start use.
+
+BSNP v1 is insufficient for general mid-episode continuation. Proven
+omissions include plant coordinates, age, active flag, RNG and growth state;
+scheduled falling-block updates and pending landings; overflow item stacks,
+coordinates and delays; live-simulation counters and non-item slots; both
+world-clock counters and weather state; and mob/dragon, projectile, fluid,
+portal/dimension, terminal, furnace, chest, craft-grid, cursor, held-use,
+eat/bow, and render/controller histories.
+
+The format has no unsafe-state mask and no hidden-state digest. A delayed
+source-vs-restore fixture with seeded plant, overflow, and falling state
+produced different observations, camera/depth/edge data, and projected v1
+region bytes at engine tick 2. This disproves any positive universal
+continuation window.
+
+For one exact `farm_one_log_sdg` trace, source and restore were measured equal
+for a 4-engine-tick WAIT continuation. An alternate look diverged after 8
+ticks, as expected for a different action; that result is not source/restore
+equality. The producer's 8-tick cap is only a bounded diagnostic budget. It
+does not establish a valid 8-tick window. Only the listed exact WAIT trace
+passed; general continuation validity is unestablished and the guaranteed
+window is zero.
+
+Branch rows carry machine-readable `status: experimental`,
+`training_eligible: false`, and `guaranteed_continuation_ticks: 0` metadata.
+The current verl training agent loop refuses BSNP v1 branch rows before
+opening Netherite. There is intentionally no unsafe opt-in. Direct
+`NetheriteEnvironment` opening remains available for diagnostics and tests.
+
+The producer requires a task with explicit
+`initial_state.world.time` and `mobs: false`. Both `prefix` and mandatory
+`continuation` accept only camera movement, `wait`, and movement keys
+`w/a/s/d/space/sneak/sprint`. Attack/use, hotbar selection, inventory/GUI
+keys, clicks, crafting, smelting, and container interaction are rejected. A
+settling turn then has to produce an on-ground snapshot with zero horizontal
+motion, only the engine's canonical grounded-gravity vertical value, zero
+fall distance, dig/use/attack delay, sprint latch, hurt-velocity reset, and no
+open container. Mobs are disabled at engine launch. Producers and consumers
+both reload the task and require explicit `time` and `mobs: false`; hand-built
+rows cannot bypass those prerequisites. Branch
+`view_distance` is restricted to 1..8 and `settle_ticks` to 2..200.
+
+```yaml
+count: 32
+generator:
+  type: bedrock_rl.sdg:BranchPointDatasetGenerator
+  task: task.yaml
+  settle_ticks: 10
+  prefix:
+    - [{action: mouse_move, coordinate: [560, 500]}]
+    - [{action: key, k: w, ticks: 8}]
+  continuation:
+    - [{action: wait, ticks: 1}]
+executor: {type: bedrock_rl.sdg:ProcessExecutor, workers: auto}
+writer: bedrock_rl.sdg:ParquetWriter
+output: datasets/branch_prompts.parquet
+```
+
+The usual four episode coordinates remain `task_yaml`, `seed`, `init_yaw`,
+and `init_pitch`. A branch row adds the optional fifth coordinate
+`branch_state`:
+
+```json
+{
+  "schema": "bedrock.branch-state.v1",
+  "snapshot_ref": "datasets/branch_snapshots/<sha256>.bsnp",
+  "snapshot_sha256": "<64 lowercase hex digits>",
+  "task_sha256": "<sha256 of exact task YAML bytes>",
+  "engine_identity": {
+    "actual": {"head": "...", "manifest": {"source": "..."}},
+    "expected": {"head": "...", "manifest": {}},
+    "binary": {"name": "magma_game", "sha256": "<executable sha256>"}
+  },
+  "runtime": {
+    "raster": "cpu",
+    "view_distance": 8,
+    "render_set": {"anim_textures": 0, "no_hand": 1},
+    "random_ticks": false
+  },
+  "certification": {
+    "profile": "netherite.bsnp-v1-experimental.v1",
+    "snapshot_format": "BSNP/1",
+    "action_domain": "movement-look-wait",
+    "snapshot_tick": 42,
+    "world_time": 1042,
+    "settle_ticks": 10,
+    "max_probe_ticks": 8
+  }
+}
+```
+
+Snapshots always live in the producer-owned
+`datasets/branch_snapshots` directory beside the task. The reference must use
+exactly that directory, canonical task-relative POSIX syntax, and a digest
+basename.
+Absolute paths, dot/traversal components, duplicate separators, backslashes,
+and snapshot symlinks are rejected. Task bytes, snapshot bytes, selected CPU
+executable bytes, pinned checkout, the exact recorded original `0001`-`0012`
+stack, raster, view distance, disabled random ticks, and render settings must
+all match. Because v1
+omits the clock, the producer records the task's explicit boot time plus
+elapsed engine ticks and the consumer supplies that value on reopen. This
+aligns the measured row but cannot reconstruct unrecorded clock history.
+Rendering pins animated textures off and hides the first-person hand.
+
+This path confinement is a trusted-dataset integrity boundary, not a claim
+that an attacker controlling the task directory cannot race path lookup.
+Content TOCTOU is bounded away from the engine: the source file is opened
+without following its final symlink, hashed while copied to a process-private
+mode-0400 path, and Netherite completes snapshot loading before that private
+copy is deleted.
+
+Opening a branch is a **new Episode**, not a continuation of the prefix's
+Python reward bookkeeping. The snapshot supplies Minecraft world/player
+state. Inventory/position baselines and convergence potential are refreshed
+after t0, so setup ticks cannot be credited to the first model action; a
+position, inventory, screen, or already-terminal mutation during setup rejects
+the branch. Setup events are excluded by a new
+`journal_start`, engine tick accounting restarts at zero before the branch
+`t0` capture, and turn/action counts, malformed penalties, terminal flags,
+one-shot shaping latches, and convergence potential accumulation are all
+initialized as a new Episode. Task limits and the existing reward formula are
+unchanged; no prefix reward or new branch reward is introduced.
+
+The emitted row has the standard `prompt`, `images`, `extra_info`, and
+`tools_kwargs.computer.create_kwargs` fields, including view and CPU runtime
+provenance. `extra_info.branch_probe` records the continuation turn count,
+source tick interval, enforced maximum, snapshot format, and identical final
+represented-state digests. It labels the scope as BSNP-v1 fields only.
+`rollout_n` remains a trainer sampling choice, but arbitrary sampled actions
+are outside the empirical continuation claim.
+
 ## Successful demonstrations
 
 A scripted policy is a closed-loop agent. It receives a fresh live episode

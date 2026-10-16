@@ -596,7 +596,7 @@ def check_engine(netherite_home=None):
 
 def engine_argv(binary, seed, frame_w, frame_h, view_distance,
                 mobs=False, snapshot_in=None, protocol="--rl-bin",
-                world_time=None):
+                world_time=None, render_set=None):
     """The engine command line every process in this repo is started with.
 
     ONE place builds it. A second hand-written argv is how a process ends
@@ -636,7 +636,11 @@ def engine_argv(binary, seed, frame_w, frame_h, view_distance,
     # NETHERITE_RENDER_SET carries extra registry knobs for recordings, as a
     # comma list of key=value (no_hand=1, hide_gui=1). Nothing in RlBinObs
     # samples them; they change rendered pixels only.
-    for kv in os.environ.get("NETHERITE_RENDER_SET", "").split(","):
+    values = (os.environ.get("NETHERITE_RENDER_SET", "").split(",")
+              if render_set is None else
+              [f"{key}={value}" for key, value in sorted(
+                  dict(render_set).items())])
+    for kv in values:
         if kv.strip():
             argv += ["--set", kv.strip()]
     return argv
@@ -660,7 +664,7 @@ def engine_argv(binary, seed, frame_w, frame_h, view_distance,
 DEFAULT_JOURNAL = os.environ.get("NETHERITE_JOURNAL", "1") == "1"
 
 
-def engine_env(lazy_frames=True, gpu=None):
+def engine_env(lazy_frames=True, gpu=None, random_ticks=None):
     """The environment every engine process is started with.
 
     MAGMA_GUI_RL is on by default in EVERY process that runs an episode
@@ -676,6 +680,10 @@ def engine_env(lazy_frames=True, gpu=None):
         # Pin this environment process away from trainer/rollout devices.
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["MAGMA_GUI_RL"] = os.environ.get("MAGMA_GUI_RL", "1")
+    if random_ticks is False:
+        env["MAGMA_RANDTICK"] = "0"
+    elif random_ticks is True:
+        env.pop("MAGMA_RANDTICK", None)
     return env
 
 
@@ -1182,7 +1190,8 @@ class MagmaEnv(ObsHelpers):
                  frames_dir=None, frame_w=854, frame_h=480,
                  snapshot_in=None, raster=None, gpu=None,
                  view_distance=None, capture_every=None, journal=None,
-                 timeout=None, world_time=None):
+                 timeout=None, world_time=None, render_set=None,
+                 random_ticks=None):
         # raster: "cpu" | "cuda" (default from NETHERITE_RASTER). gpu is the
         # device list visible to a CUDA raster process and is ignored on CPU.
         self.netherite_home = netherite_home
@@ -1215,6 +1224,9 @@ class MagmaEnv(ObsHelpers):
         self.seed = int(seed)
         self.mobs = mobs
         self.world_time = world_time
+        self.render_set = (None if render_set is None
+                           else dict(render_set))
+        self.random_ticks = random_ticks
         self.snapshot_in = snapshot_in
         self.frames_dir = None if frames_dir is None else Path(frames_dir)
         self.frame_w, self.frame_h = frame_w, frame_h
@@ -1243,7 +1255,8 @@ class MagmaEnv(ObsHelpers):
         argv = engine_argv(self.binary, self.seed, self.frame_w,
                            self.frame_h, self.view_distance, mobs=self.mobs,
                            snapshot_in=self.snapshot_in,
-                           world_time=self.world_time)
+                           world_time=self.world_time,
+                           render_set=self.render_set)
         if self.frames_dir is None:
             argv += ["--render", "off"]
         else:
@@ -1283,7 +1296,8 @@ class MagmaEnv(ObsHelpers):
         self._last_frame = -1
         env = engine_env(
             lazy_frames=not self.capture_every,
-            gpu=self.gpu if self.raster == "cuda" else None)
+            gpu=self.gpu if self.raster == "cuda" else None,
+            random_ticks=self.random_ticks)
         # The journal gets its OWN pipe. It cannot share stdout: the
         # observation record is byte-frozen, and _read_obs resynchronises
         # on a four-byte magic, so a journal record that happened to
@@ -1306,6 +1320,10 @@ class MagmaEnv(ObsHelpers):
             self._jreader = _journal.JournalReader()
         self.journal = []
         self.obs = self._read_obs()
+        # Absolute r->tick at process boot.  The wrapper's public ``ticks``
+        # counter is reset after episode pose setup, while this origin remains
+        # the exact way to derive elapsed world-clock ticks from obs["tick"].
+        self.engine_tick_origin = int(self.obs["tick"])
         self.ticks = 0
 
     def describe(self):

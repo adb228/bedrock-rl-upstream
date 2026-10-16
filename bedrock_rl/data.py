@@ -70,10 +70,16 @@ def disabled_validation_table(source):
     }]
     extra = row.get("extra_info") or {}
     extra.update({"seed": -1, "init_yaw": 0.0, "init_pitch": 0.0})
+    # A disabled-validation sentinel is deliberately not a real episode.
+    # Keeping a source row's branch coordinate while replacing its other
+    # coordinates would make it look replayable and retain a large artifact
+    # reference that the sentinel must never open.
+    extra.pop("branch_state", None)
     create = (((extra.get("tools_kwargs") or {}).get("computer") or {})
               .get("create_kwargs"))
     if isinstance(create, dict):
         create.update({"seed": -1, "init_yaw": 0.0, "init_pitch": 0.0})
+        create.pop("branch_state", None)
     row["extra_info"] = extra
     return pa.Table.from_pylist([row], schema=table.schema)
 

@@ -17,6 +17,7 @@ from bedrock_rl.sdg.generation import (
 from bedrock_rl.sdg.pipeline import (
     DATA_SOURCE,
     INTERFACE,
+    BranchPointDatasetGenerator,
     EpisodeDatasetGenerator,
     ExpertPolicy,
     ScriptedEpisodeGenerator,
@@ -50,6 +51,7 @@ __all__ = (
     "Case",
     "CaseFile",
     "CaseRejected",
+    "BranchPointDatasetGenerator",
     "EpisodeDatasetGenerator",
     "ExpertPolicy",
     "GenerationSpec",
