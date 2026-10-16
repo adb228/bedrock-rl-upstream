@@ -23,6 +23,7 @@ Start with the page for the thing you are changing:
 | Understand package boundaries and extension points | [Architecture](architecture.md) |
 | Create a Minecraft environment and reward | [Make a task](tasks.md) |
 | Generate prompts or successful demonstrations | [Synthetic data](synthetic-data.md) |
+| Validate a privileged mine/craft/place chain without producing training data | [`craft_wooden_pickaxe_sdg`](../examples/craft_wooden_pickaxe_sdg) |
 | Train locally, on several nodes, or on Modal | [Launch training](training.md) |
 | Use or register another VLM family | [Models](models.md) |
 | Add tools, context management, hints, probes, or a harness | [Customize the agent](custom-agents.md) |

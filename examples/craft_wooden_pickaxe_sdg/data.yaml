@@ -1,0 +1,57 @@
+worlds: 1
+samples_per_world: 1
+seed: 20260915
+max_world_attempts: 1
+sampler:
+  type: bedrock_rl.sdg:SeedCases
+  seeds: [0]
+  decision_seeds: [2026091501]
+generator:
+  type: bedrock_rl.sdg:ScriptedEpisodeGenerator
+  task: task.yaml
+  policy:
+    type: bedrock_rl.sdg.policy.progression:SurvivalProgressionPolicy
+    spec:
+      stages:
+        - name: logs
+          blocks: [log]
+          count: 3
+          drop: log
+          mining_ticks: 65
+          route_kinds: [surface]
+          after:
+            - {type: craft, item: planks, minimum: 12, grid: 2}
+            - {type: craft, item: stick, minimum: 2, grid: 2}
+            - {type: craft, item: crafting_table, minimum: 1, grid: 2}
+            - type: workstation
+              key: table_logs
+              item: crafting_table
+              block: crafting_table
+              container: crafting_table
+            - type: craft
+              item: wooden_pickaxe
+              minimum: 1
+              grid: 3
+              table: table_logs
+      portal: false
+      hotbar:
+        swap_priority: [planks, stick, crafting_table]
+  include_images: true
+executor:
+  type: bedrock_rl.sdg:SerialExecutor
+writer:
+  type: bedrock_rl.sdg:TrajectoryArtifactWriter
+  compact: true
+  replay:
+    gif: datasets/craft_wooden_pickaxe.replay.gif
+    views: [netherite-procedural]
+    labels: [Netherite procedural replay]
+    recording_every: 3
+    panel_width: 240
+    replay_workers: 1
+output: datasets/craft_wooden_pickaxe.trajectory.json
+rejections_output: datasets/craft_wooden_pickaxe.rejections.jsonl
+metadata:
+  task: craft_wooden_pickaxe_sdg
+  purpose: controller_environment_verifier_validation
+  training_eligible: false

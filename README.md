@@ -94,6 +94,11 @@ pools, or Modal CPU fleets. Accepted parquet and the rejection ledger are
 published atomically, and every row retains enough provenance to reproduce
 its world, decision, plan, and controls.
 
+[`craft_wooden_pickaxe_sdg`](examples/craft_wooden_pickaxe_sdg) is the
+non-training progression reference: one fixed CPU world mines three logs,
+crafts and places a workstation, crafts a wooden pickaxe, saves terminal
+inventory evidence, and deterministically replays the accepted action stream.
+
 ## Example training run
 
 [`equip_pickaxe_grpo`](examples/equip_pickaxe_grpo) randomizes all nine hotbar

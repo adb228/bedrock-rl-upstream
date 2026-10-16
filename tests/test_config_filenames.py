@@ -23,6 +23,7 @@ class ConfigFilenameTests(unittest.TestCase):
         self.assertEqual(
             {Path(path).relative_to(ROOT).as_posix() for path in task_files()},
             {
+                "examples/craft_wooden_pickaxe_sdg/task.yaml",
                 "examples/equip_pickaxe_grpo/task.yaml",
                 "examples/farm_one_log_sdg/task.yaml",
             },
